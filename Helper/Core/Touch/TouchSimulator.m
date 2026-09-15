@@ -125,16 +125,42 @@ static NSMutableDictionary *_swipeInfo;
     /// State
     static double _dockSwipeOriginOffset = 0.0;
     static double _dockSwipeLastDelta = 0.0;
+    static CFTimeInterval _dockSwipeLastPostTime = 0.0;
+    static double _dockSwipeCoalescedDelta = 0.0;
     static NSTimer *_doubleSendTimer;
     static NSTimer *_tripleSendTimer;
     
-    /// Update originOffset
-    
+    /// Update originOffset and coalesce macOS 27 Changed events to roughly the cadence
+    /// of a real trackpad (~125 Hz / 8 ms). The absolute progress is always accumulated
+    /// before throttling, so skipped input reports never lose movement.
     if (phase == kIOHIDEventPhaseBegan) {
         _dockSwipeOriginOffset = d;
+        if (@available(macOS 27.0, *)) {
+            _dockSwipeLastPostTime = CACurrentMediaTime();
+            _dockSwipeCoalescedDelta = 0.0;
+        }
     } else if (phase == kIOHIDEventPhaseChanged) {
         if (d == 0) return;
         _dockSwipeOriginOffset += d;
+        if (@available(macOS 27.0, *)) {
+            _dockSwipeCoalescedDelta += d;
+            CFTimeInterval now = CACurrentMediaTime();
+            if (now - _dockSwipeLastPostTime < (1.0 / 125.0)) return;
+            _dockSwipeLastPostTime = now;
+            d = _dockSwipeCoalescedDelta;
+            _dockSwipeCoalescedDelta = 0.0;
+        }
+    } else if (phase == kIOHIDEventPhaseEnded || phase == kIOHIDEventPhaseCancelled) {
+        if (@available(macOS 27.0, *)) {
+            /// If the button is released inside the coalescing interval, the final absolute
+            /// progress is already correct. Preserve the pending movement as the recent
+            /// delta as well, so exit velocity and end-vs-cancel direction stay meaningful.
+            if (_dockSwipeCoalescedDelta != 0.0) {
+                _dockSwipeLastDelta = _dockSwipeCoalescedDelta;
+            }
+            _dockSwipeCoalescedDelta = 0.0;
+            _dockSwipeLastPostTime = 0.0;
+        }
     }
     
     /// Debug
@@ -322,41 +348,53 @@ static NSMutableDictionary *_swipeInfo;
         
     } else if (phase == kIOHIDEventPhaseEnded || phase == kIOHIDEventPhaseCancelled) {
 
-        /// Double-send end-events
-        /// Notes:
-        ///     - The inital dockSwipe event we post will be ignored by the system when it is under load (I called this the "stuck bug" in other places). Sending the event again with a delay of 200ms (0.2s) gets it unstuck almost always. Sending the event twice gives us the best of both responsiveness and reliability.
-        ///     - In Scroll.m, even with sending the event again after 0.2 seconds, the stuck bug still happens a bunch for some reason. Even though this almost completely eliminates the bug in ModifiedDrag.m . Sending it again after 0.5 seconds works better but still sometimes happens.
-        ///         Edit: Doesn't happen anymore on M1. Edit 2: [Feb 2025] The double-sending code used to be broken for a while (fixed in e8f90d2f32829e3e5f1621fa8e4b58634c9ea07b) . Maybe that's why we observed the stuck-bug for Scroll.m here?
-
-        /// Put the events into a dict
-        ///     Note: The `events` dict retains the events, and the timers retain the events dict -> Once the timers are invalidated, the events are automatically released.
-        ///     Edit: We didn't release the events in MMF 3.0.0 Beta 6. I wonder why I didn't notice this? (Should leak a little bit of memory.) We then moved to using `__bridge_transfer`
-        ///                 On 28.08.2024 we moved to using `__bridge` and simply calling `CFRelease()` afterwards. (That's the same as using `__bridge_transfer`, which I find confusing.)
-
-        NSMutableDictionary *events = [NSMutableDictionary new];
-        events[@"e30"] = (__bridge id)e30;
-        events[@"e29"] = (__bridge id)e29;
-        
-        /// Dispatch to main queue
-        /// Notes:
-        ///     - 27.08.2024 (macOS Sequoia Beta) - The double/triple send didn't work. I fixed it by adding  `dispatch_async(dispatch_get_main_queue()`. Not sure how long this had been broken. (Fixed in e8f90d2f32829e3e5f1621fa8e4b58634c9ea07b)
-        ///     - Might worsen responsivity to do this on the main thread? I feel like we should simplify the threading of the entire app so there are 4 threads: input events, output events, ui (main thread) and background (stuff like checking for updates)
-        ///         - Update: [ Apr 2025] We plan to simplify threading now. grep for IOThread
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            
-            /// Invalidate existing timers
+        if (@available(macOS 27.0, *)) {
+            /// A/B path for macOS 27: do not re-post stale End events at +200ms/+500ms.
+            /// Those delayed events can overlap the next rapid gesture and add transition latency.
+            /// Keep the old workaround intact on earlier macOS versions until this is proven safe.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (_doubleSendTimer != nil) [_doubleSendTimer invalidate];
+                if (_tripleSendTimer != nil) [_tripleSendTimer invalidate];
+                _doubleSendTimer = nil;
+                _tripleSendTimer = nil;
+            });
+        } else {
+            /// Double-send end-events
             /// Notes:
-            ///     - Docs say timers must be scheduled and invalidated from the same thread. We should be doing that since we dispatch everything to the main queue
-            
-            if (_doubleSendTimer != nil) [_doubleSendTimer invalidate];
-            if (_tripleSendTimer != nil) [_tripleSendTimer invalidate];
+            ///     - The inital dockSwipe event we post will be ignored by the system when it is under load (I called this the "stuck bug" in other places). Sending the event again with a delay of 200ms (0.2s) gets it unstuck almost always. Sending the event twice gives us the best of both responsiveness and reliability.
+            ///     - In Scroll.m, even with sending the event again after 0.2 seconds, the stuck bug still happens a bunch for some reason. Even though this almost completely eliminates the bug in ModifiedDrag.m . Sending it again after 0.5 seconds works better but still sometimes happens.
+            ///         Edit: Doesn't happen anymore on M1. Edit 2: [Feb 2025] The double-sending code used to be broken for a while (fixed in e8f90d2f32829e3e5f1621fa8e4b58634c9ea07b) . Maybe that's why we observed the stuck-bug for Scroll.m here?
 
-            /// Schedule new timers
+            /// Put the events into a dict
+            ///     Note: The `events` dict retains the events, and the timers retain the events dict -> Once the timers are invalidated, the events are automatically released.
+            ///     Edit: We didn't release the events in MMF 3.0.0 Beta 6. I wonder why I didn't notice this? (Should leak a little bit of memory.) We then moved to using `__bridge_transfer`
+            ///                 On 28.08.2024 we moved to using `__bridge` and simply calling `CFRelease()` afterwards. (That's the same as using `__bridge_transfer`, which I find confusing.)
+
+            NSMutableDictionary *events = [NSMutableDictionary new];
+            events[@"e30"] = (__bridge id)e30;
+            events[@"e29"] = (__bridge id)e29;
             
-            _doubleSendTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 target:self selector:@selector(dockSwipeTimerFired:) userInfo:events repeats:NO];
-            _tripleSendTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(dockSwipeTimerFired:) userInfo:events repeats:NO];
-        });
+            /// Dispatch to main queue
+            /// Notes:
+            ///     - 27.08.2024 (macOS Sequoia Beta) - The double/triple send didn't work. I fixed it by adding  `dispatch_async(dispatch_get_main_queue()`. Not sure how long this had been broken. (Fixed in e8f90d2f32829e3e5f1621fa8e4b58634c9ea07b)
+            ///     - Might worsen responsivity to do this on the main thread? I feel like we should simplify the threading of the entire app so there are 4 threads: input events, output events, ui (main thread) and background (stuff like checking for updates)
+            ///         - Update: [ Apr 2025] We plan to simplify threading now. grep for IOThread
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                
+                /// Invalidate existing timers
+                /// Notes:
+                ///     - Docs say timers must be scheduled and invalidated from the same thread. We should be doing that since we dispatch everything to the main queue
+                
+                if (_doubleSendTimer != nil) [_doubleSendTimer invalidate];
+                if (_tripleSendTimer != nil) [_tripleSendTimer invalidate];
+
+                /// Schedule new timers
+                
+                _doubleSendTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 target:self selector:@selector(dockSwipeTimerFired:) userInfo:events repeats:NO];
+                _tripleSendTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(dockSwipeTimerFired:) userInfo:events repeats:NO];
+            });
+        }
         
     }
     
