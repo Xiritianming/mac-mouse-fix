@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/macos27-dockswipe-smoothness
+      - fix/macos27-dockswipe-coalescing
   workflow_dispatch:
 
 permissions:
@@ -90,4 +91,4 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-# trigger-build: 2026-09-15
+# trigger-build: 2026-09-16-coalescing
