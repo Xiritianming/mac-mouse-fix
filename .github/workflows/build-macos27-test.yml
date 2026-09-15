@@ -89,3 +89,5 @@ jobs:
           path: ${{ runner.temp }}/xcodebuild.log
           if-no-files-found: ignore
           retention-days: 7
+
+# trigger-build: 2026-09-15
