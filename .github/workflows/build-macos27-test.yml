@@ -1,0 +1,91 @@
+name: Build macOS 27 test app
+
+on:
+  push:
+    branches:
+      - fix/macos27-dockswipe-smoothness
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Build Release app
+        run: |
+          set -o pipefail
+          rm -rf "$RUNNER_TEMP/mmf-derived-data"
+          xcodebuild \
+            -project "Mouse Fix.xcodeproj" \
+            -scheme "App - Release" \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/mmf-derived-data" \
+            -jobs 4 \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Ad-hoc sign app
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/mmf-derived-data/Build/Products/Release/Mac Mouse Fix.app"
+          HELPER="$APP/Contents/Library/LoginItems/Mac Mouse Fix Helper.app"
+
+          test -d "$APP"
+          test -d "$HELPER"
+
+          codesign --force --sign - --timestamp=none "$HELPER"
+          codesign --force --deep --sign - --timestamp=none "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          echo "App architectures:"
+          lipo -archs "$APP/Contents/MacOS/Mac Mouse Fix"
+          echo "Helper architectures:"
+          lipo -archs "$HELPER/Contents/MacOS/Mac Mouse Fix Helper"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/mmf-derived-data/Build/Products/Release/Mac Mouse Fix.app"
+          OUT="$RUNNER_TEMP/MacMouseFix-macOS27-dockswipe-test.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT"
+          shasum -a 256 "$OUT" | tee "$RUNNER_TEMP/MacMouseFix-macOS27-dockswipe-test.sha256"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacMouseFix-macOS27-dockswipe-test
+          path: |
+            ${{ runner.temp }}/MacMouseFix-macOS27-dockswipe-test.zip
+            ${{ runner.temp }}/MacMouseFix-macOS27-dockswipe-test.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
