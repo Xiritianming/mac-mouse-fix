@@ -156,8 +156,8 @@ func MFCatch<R, E>(_ workload: () async throws(E) -> R) async -> (R?, E?) {
         
         let result: String?
 #if FORCE_REGION_CODE
-        /// Test-build override. Keep normal builds tied to the user's system region.
-        result = "CN"
+        /// Test-build override. Use a neutral sentinel so this path can be tested without depending on the user's system region.
+        result = "ZZ"
 #else
         if #available(macOS 13, *) {
             result = Locale.current.region?.identifier
