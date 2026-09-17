@@ -5,6 +5,7 @@ on:
     branches:
       - fix/macos27-dockswipe-smoothness
       - fix/macos27-dockswipe-coalescing
+      - test/forced-region-code
   workflow_dispatch:
 
 permissions:
@@ -38,6 +39,7 @@ jobs:
             -jobs 4 \
             ARCHS="arm64 x86_64" \
             ONLY_ACTIVE_ARCH=NO \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) FORCE_REGION_CODE' \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -68,17 +70,17 @@ jobs:
         run: |
           set -euo pipefail
           APP="$RUNNER_TEMP/mmf-derived-data/Build/Products/Release/Mac Mouse Fix.app"
-          OUT="$RUNNER_TEMP/MacMouseFix-macOS27-dockswipe-test.zip"
+          OUT="$RUNNER_TEMP/MacMouseFix-macOS27-forced-region-test.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT"
-          shasum -a 256 "$OUT" | tee "$RUNNER_TEMP/MacMouseFix-macOS27-dockswipe-test.sha256"
+          shasum -a 256 "$OUT" | tee "$RUNNER_TEMP/MacMouseFix-macOS27-forced-region-test.sha256"
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MacMouseFix-macOS27-dockswipe-test
+          name: MacMouseFix-macOS27-forced-region-test
           path: |
-            ${{ runner.temp }}/MacMouseFix-macOS27-dockswipe-test.zip
-            ${{ runner.temp }}/MacMouseFix-macOS27-dockswipe-test.sha256
+            ${{ runner.temp }}/MacMouseFix-macOS27-forced-region-test.zip
+            ${{ runner.temp }}/MacMouseFix-macOS27-forced-region-test.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -91,4 +93,4 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-# trigger-build: 2026-09-16-coalescing
+# forced-region-test: ZZ
