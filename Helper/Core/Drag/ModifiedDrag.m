@@ -48,6 +48,13 @@
 
 static ModifiedDragState _drag;
 
+/// Lightweight diagnostics for the three-finger DockSwipe hot path.
+/// We aggregate values and log once per gesture so diagnostics don't add per-event logging overhead.
+static BOOL _threeFingerPerfActive = NO;
+static uint64_t _threeFingerPerfInputEvents = 0;
+static double _threeFingerPerfQueueLatencyTotalMs = 0.0;
+static double _threeFingerPerfQueueLatencyMaxMs = 0.0;
+
 //static CGEventTapProxy _tapProxy;
 
 //+ (CGEventTapProxy)tapProxy {
@@ -236,9 +243,11 @@ static CGEventRef __nullable eventTapCallBack(CGEventTapProxy proxy, CGEventType
     
     if (dx != 0 || dy != 0) {
         
-        /// Make copy of event for _drag.queue
-        
-        CGEventRef eventCopy = CGEventCreateCopy(event);
+        /// Capture the small pieces of event data we actually need before leaving the event-tap callback.
+        /// Previously we created and retained a full CGEvent copy for every non-zero mouse report,
+        /// even though the ThreeFingerSwipe/TwoFingerSwipe paths never use the event object.
+        CGPoint eventLocation = CGEventGetLocation(event);
+        CGEventTimestamp eventTimestamp = CGEventGetTimestamp(event);
         
         /// Do main processing on _drag.queue
         
@@ -253,16 +262,14 @@ static CGEventRef __nullable eventTapCallBack(CGEventTapProxy proxy, CGEventType
                 return;
             }
             
-            /// Update originOffset
+            /// Update originOffset / latest event metadata
             
             _drag.originOffset.x += dx;
             _drag.originOffset.y += dy;
+            _drag.latestEventLocation = eventLocation;
             
             /// Suspension
             if (_drag.isSuspended) return;
-            
-            /// Debug
-            DDLogDebug("ModifiedDrag handling mouseMoved");
             
             /// Call further handler functions depending on current state
             
@@ -275,11 +282,23 @@ static CGEventRef __nullable eventTapCallBack(CGEventTapProxy proxy, CGEventType
                 
             } else if (st == kMFModifiedInputActivationStateInitialized) {
                 
-                handleMouseInputWhileInitialized(dx, dy, eventCopy);
+                handleMouseInputWhileInitialized(dx, dy, eventLocation);
                 
             } else if (st == kMFModifiedInputActivationStateInUse) {
                 
-                handleMouseInputWhileInUse(dx, dy, eventCopy);
+                if (_threeFingerPerfActive) {
+                    /// CGEvent timestamps are nanoseconds since system startup, while CACurrentMediaTime()
+                    /// uses the same monotonic system-time domain in seconds.
+                    double inputTimeSeconds = ((double)eventTimestamp) / (double)NSEC_PER_SEC;
+                    double queueLatencyMs = (CACurrentMediaTime() - inputTimeSeconds) * 1000.0;
+                    if (queueLatencyMs >= 0.0 && queueLatencyMs < 1000.0) {
+                        _threeFingerPerfInputEvents += 1;
+                        _threeFingerPerfQueueLatencyTotalMs += queueLatencyMs;
+                        _threeFingerPerfQueueLatencyMaxMs = MAX(_threeFingerPerfQueueLatencyMaxMs, queueLatencyMs);
+                    }
+                }
+                
+                handleMouseInputWhileInUse(dx, dy, NULL);
             }
             
         });
@@ -297,7 +316,7 @@ static CGEventRef __nullable eventTapCallBack(CGEventTapProxy proxy, CGEventType
     return event;
 }
 
-static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGEventRef event) {
+static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGPoint eventLocation) {
     
     /// Activate the modified drag if the mouse has been moved far enough from the point where the drag started
     
@@ -308,7 +327,7 @@ static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGE
         DDLogDebug("Modified Drag entered 'in use' state");
         
         /// Store state
-        _drag.usageOrigin = getRoundedPointerLocationWithEvent(event);
+        _drag.usageOrigin = (CGPoint){ .x = floor(eventLocation.x), .y = floor(eventLocation.y) };
         
         if (fabs(ofs.x) < fabs(ofs.y)) {
             _drag.usageAxis = kMFAxisVertical;
@@ -331,6 +350,12 @@ static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGE
     
         NSNumber *systemScrollDirection = [NSUserDefaults.standardUserDefaults objectForKey:@"com.apple.swipescrolldirection"];
         _drag.naturalDirection = systemScrollDirection == nil ? true : systemScrollDirection.boolValue;
+        
+        /// Reset aggregate performance diagnostics at the exact start of a three-finger gesture.
+        _threeFingerPerfActive = [_drag.type isEqualToString:kMFModifiedDragTypeThreeFingerSwipe];
+        _threeFingerPerfInputEvents = 0;
+        _threeFingerPerfQueueLatencyTotalMs = 0.0;
+        _threeFingerPerfQueueLatencyMaxMs = 0.0;
         
         /// Notify output plugin
         [_drag.outputPlugin handleBecameInUse];
@@ -425,6 +450,15 @@ void deactivate_Unsafe(BOOL cancel) {
     ///     Notify plugin
     if (_drag.activationState == kMFModifiedInputActivationStateInUse) {
         [_drag.outputPlugin handleDeactivationWhileInUseWithCancel:cancel];
+        
+        if (_threeFingerPerfActive) {
+            double avgQueueLatencyMs = _threeFingerPerfInputEvents == 0
+                ? 0.0
+                : _threeFingerPerfQueueLatencyTotalMs / (double)_threeFingerPerfInputEvents;
+            DDLogInfo("DockSwipe perf: modified-drag inputs=%llu, queue latency avg=%.3fms max=%.3fms",
+                      _threeFingerPerfInputEvents, avgQueueLatencyMs, _threeFingerPerfQueueLatencyMaxMs);
+        }
+        _threeFingerPerfActive = NO;
     }
     
     /// Set state == none
