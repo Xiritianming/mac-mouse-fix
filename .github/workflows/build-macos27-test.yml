@@ -40,7 +40,7 @@ jobs:
             -jobs 4 \
             ARCHS="arm64 x86_64" \
             ONLY_ACTIVE_ARCH=NO \
-            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) FORCE_REGION_CODE' \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) FORCE_LICENSED' \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -94,4 +94,4 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-# forced-region-test: ZZ
+# development build: FORCE_LICENSED
