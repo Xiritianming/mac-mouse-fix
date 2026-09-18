@@ -16,6 +16,14 @@ import CryptoKit
     
     static func get_Preliminary(_callingFunc: String = #function) -> MFLicenseState {
         
+#if FORCE_LICENSED
+        /// Keep the initial UI state in sync with licenseStateFromOverrides() for development builds.
+        /// Without this, the app can briefly render the trial UI before the async full license check completes.
+        return MFLicenseState(isLicensed: true,
+                              freshness: kMFValueFreshnessFresh,
+                              licenseTypeInfo: MFLicenseTypeInfoForce())
+#endif
+        
         /// This is a quick, preliminary way to get the licenseState, that's intended to render the UI immediately upon app-startup with probably-correct data.
         /// Note:
         ///     We set `enableOfflineValidation: false`when getting the cached licenseState so we don't have to retrieve the actual `licenseKey` and `deviceUID` here. I guess as an optimization? Or minimization of shared state to avoid race conditions? Not totally sure this makes sense.
