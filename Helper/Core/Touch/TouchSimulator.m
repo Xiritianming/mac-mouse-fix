@@ -127,6 +127,8 @@ static NSMutableDictionary *_swipeInfo;
     static double _dockSwipeLastDelta = 0.0;
     static CFTimeInterval _dockSwipeLastPostTime = 0.0;
     static double _dockSwipeCoalescedDelta = 0.0;
+    static uint64_t _dockSwipeChangedInputCount = 0;
+    static uint64_t _dockSwipeChangedPostCount = 0;
     static NSTimer *_doubleSendTimer;
     static NSTimer *_tripleSendTimer;
     
@@ -138,17 +140,21 @@ static NSMutableDictionary *_swipeInfo;
         if (@available(macOS 27.0, *)) {
             _dockSwipeLastPostTime = CACurrentMediaTime();
             _dockSwipeCoalescedDelta = 0.0;
+            _dockSwipeChangedInputCount = 0;
+            _dockSwipeChangedPostCount = 0;
         }
     } else if (phase == kIOHIDEventPhaseChanged) {
         if (d == 0) return;
         _dockSwipeOriginOffset += d;
         if (@available(macOS 27.0, *)) {
+            _dockSwipeChangedInputCount += 1;
             _dockSwipeCoalescedDelta += d;
             CFTimeInterval now = CACurrentMediaTime();
             if (now - _dockSwipeLastPostTime < (1.0 / 125.0)) return;
             _dockSwipeLastPostTime = now;
             d = _dockSwipeCoalescedDelta;
             _dockSwipeCoalescedDelta = 0.0;
+            _dockSwipeChangedPostCount += 1;
         }
     } else if (phase == kIOHIDEventPhaseEnded || phase == kIOHIDEventPhaseCancelled) {
         if (@available(macOS 27.0, *)) {
@@ -164,27 +170,16 @@ static NSMutableDictionary *_swipeInfo;
     }
     
     /// Debug
-    
-    if (runningPreRelease()) {
-        static CFTimeInterval _dockSwipeLastTimeStamp = 0.0;
-        CFTimeInterval ts = CACurrentMediaTime();
-        CFTimeInterval timeDiff = ts - _dockSwipeLastTimeStamp;
-        _dockSwipeLastTimeStamp = ts;
-        DDLogDebug("Dock Swipe send with "
-                   "delta: %@, "
-                   //"lastDelta: %@, "
-                   //"prevOriginOffset: %@ "
-                   //"type: %@, "
-                   "phase: %@, "
-                   "timeSinceLast: %@"
-                   ,
-                   @(d),
-                   //@(_dockSwipeLastDelta),
-                   //@(_dockSwipeOriginOffset),
-                   //@(type),
-                   @(phase),
-                   @(timeDiff));
-    }
+    /// Keep per-event diagnostics out of Release/Beta hot paths. Aggregate metrics are
+    /// logged once per gesture below instead.
+#if DEBUG
+    static CFTimeInterval _dockSwipeLastTimeStamp = 0.0;
+    CFTimeInterval ts = CACurrentMediaTime();
+    CFTimeInterval timeDiff = ts - _dockSwipeLastTimeStamp;
+    _dockSwipeLastTimeStamp = ts;
+    DDLogDebug("Dock Swipe send with delta: %@, phase: %@, timeSinceLast: %@",
+               @(d), @(phase), @(timeDiff));
+#endif
     
     /// Determine exitSpeed
     /// Notes:
@@ -324,27 +319,32 @@ static NSMutableDictionary *_swipeInfo;
     
     /// Send events
     
+#if DEBUG
     DDLogDebug("TouchSimulator: Sending dockSwipe with phase %d with events: %@ %@", phase, e30, e29);
+#endif
     
     if (e30) CGEventPost(kCGSessionEventTap, e30); /// Not sure if order matters
     if (e29) CGEventPost(kCGSessionEventTap, e29); /// This is NULL on macOS 27. Doesn't cause issues but logs `invalid CGEvent: 0x0` error.
     
     if (phase == kIOHIDEventPhaseBegan) {
         
-        dispatch_async(dispatch_get_main_queue(), ^{
-            
-            /// Invalidate scheduled double-send
-            /// Notes:
-            ///     - We invalidate the double/triple send timers here, since otherwise, the double/triple-sent end events can cancel the new gesture.
-            ///     - Docs say timers must be scheduled and invalidated from the same thread. That's why we dispatch to the main thread.
-            ///     - Threading is a bit messy. We should probably have a unified output-event thread, where we do all this.
-            ///     - Race condition? – Since we dispatch_async() right above, in edge-cases, the gesture might still be canceled right after the kIOHIDEventPhaseBegan events are sent. A unified output-event thread should allow us to fix this.
-            
-            if (_doubleSendTimer != nil) [_doubleSendTimer invalidate];
-            if (_tripleSendTimer != nil) [_tripleSendTimer invalidate];
-            _doubleSendTimer = nil;
-            _tripleSendTimer = nil;
-        });
+        /// macOS 27 never schedules the legacy delayed End timers in this branch, so
+        /// don't enqueue a main-thread invalidation block on every gesture start.
+        if (@available(macOS 27.0, *)) {
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                
+                /// Invalidate scheduled double-send
+                /// Notes:
+                ///     - We invalidate the double/triple send timers here, since otherwise, the double/triple-sent end events can cancel the new gesture.
+                ///     - Docs say timers must be scheduled and invalidated from the same thread. That's why we dispatch to the main thread.
+                
+                if (_doubleSendTimer != nil) [_doubleSendTimer invalidate];
+                if (_tripleSendTimer != nil) [_tripleSendTimer invalidate];
+                _doubleSendTimer = nil;
+                _tripleSendTimer = nil;
+            });
+        }
         
     } else if (phase == kIOHIDEventPhaseEnded || phase == kIOHIDEventPhaseCancelled) {
 
@@ -352,12 +352,12 @@ static NSMutableDictionary *_swipeInfo;
             /// A/B path for macOS 27: do not re-post stale End events at +200ms/+500ms.
             /// Those delayed events can overlap the next rapid gesture and add transition latency.
             /// Keep the old workaround intact on earlier macOS versions until this is proven safe.
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (_doubleSendTimer != nil) [_doubleSendTimer invalidate];
-                if (_tripleSendTimer != nil) [_tripleSendTimer invalidate];
-                _doubleSendTimer = nil;
-                _tripleSendTimer = nil;
-            });
+            DDLogInfo("DockSwipe perf: changed inputs=%llu, posted=%llu, coalescing ratio=%.2fx",
+                      _dockSwipeChangedInputCount,
+                      _dockSwipeChangedPostCount,
+                      _dockSwipeChangedPostCount == 0
+                        ? 0.0
+                        : (double)_dockSwipeChangedInputCount / (double)_dockSwipeChangedPostCount);
         } else {
             /// Double-send end-events
             /// Notes:
