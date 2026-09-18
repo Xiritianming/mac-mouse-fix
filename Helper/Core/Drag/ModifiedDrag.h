@@ -51,6 +51,7 @@ typedef struct {
     CGPoint origin;
     Vector originOffset;
     CGPoint usageOrigin; /// Point at which the modified drag changed its activationState to inUse
+    CGPoint latestEventLocation; /// Captured synchronously in the event-tap callback; avoids retaining/copying CGEvent objects across the drag queue.
     MFAxis usageAxis;
     bool firstCallback;
     
@@ -65,7 +66,7 @@ typedef struct {
 
 + (void)initializeWithDragState:(ModifiedDragState *)dragStateRef;
 + (void)handleBecameInUse;
-+ (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY event:(CGEventRef)event;
++ (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY event:(CGEventRef _Nullable)event;
 + (void)handleDeactivationWhileInUseWithCancel:(BOOL)cancel;
 + (void)suspend; /// See OutputCoordinator
 + (void)unsuspend;
