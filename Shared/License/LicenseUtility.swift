@@ -155,16 +155,11 @@ func MFCatch<R, E>(_ workload: () async throws(E) -> R) async -> (R?, E?) {
         ///         > TODO: Consider updating uses of `NSLocale.preferredLocale`. (But I think `Locale.current.region?.identifier` has been working fine here?)
         
         let result: String?
-#if FORCE_REGION_CODE
-        /// Test-build override. Use a neutral sentinel so this path can be tested without depending on the user's system region.
-        result = "ZZ"
-#else
         if #available(macOS 13, *) {
             result = Locale.current.region?.identifier
         } else {
             result = Locale.current.regionCode
         }
-#endif
         
         DDLogDebug("LicenseUtility.swift: Retrieved regionCode '\(result ?? "(nil)")' from current locale '\(Locale.current)'")
         
