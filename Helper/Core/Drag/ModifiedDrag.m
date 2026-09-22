@@ -34,6 +34,10 @@
 
 #import "GlobalEventTapThread.h"
 
+@implementation CoalescableEvent @end
+@implementation CoalescableEvent_Delta @end
+@implementation CoalescableEvent_Deactivation @end
+
 @implementation ModifiedDrag
 
 /// Notes:
@@ -48,10 +52,11 @@
 
 static ModifiedDragState _drag;
 
-/// Lightweight diagnostics for the three-finger DockSwipe hot path.
-/// We aggregate values and log once per gesture so diagnostics don't add per-event logging overhead.
+/// Aggregate diagnostics for the three-finger DockSwipe path.
+/// Logged once per gesture to avoid adding per-report logging overhead.
 static BOOL _threeFingerPerfActive = NO;
 static uint64_t _threeFingerPerfInputEvents = 0;
+static uint64_t _threeFingerPerfCoalescedFrames = 0;
 static double _threeFingerPerfQueueLatencyTotalMs = 0.0;
 static double _threeFingerPerfQueueLatencyMaxMs = 0.0;
 
@@ -112,13 +117,23 @@ static double _threeFingerPerfQueueLatencyMaxMs = 0.0;
     ///     When the eventTap and the deactivate function are driven by different threads or whatever then the deactivation can happen before we've processed all the events. This allows us to avoid that issue
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, -1);
     _drag.queue = dispatch_queue_create("com.nuebling.mac-mouse-fix.helper.modified-drag", attr);
-    
+
+    /// Setup coalescingDisplayLink
+    _drag.coalescingDisplayLink = [DisplayLink displayLinkOptimizedForWorkType: kMFDisplayLinkWorkTypeEventSending displayLinkQueue: _drag.queue];
+    _drag.coalescingDisplayLink.dispatchCallbacksAsynchronously = YES;
+    _drag.coalescingDisplayLink.delayStopToNextFrame = YES;
+
+    [_drag.coalescingDisplayLink setCallback:^(DisplayLinkCallbackTimeInfo timeInfo) { coalescingDisplayLinkCallback(timeInfo); }];
+
+    /// Setup coalescableEventQueue
+    _drag.coalescableEventQueue = [NSMutableArray new];
+
     /// Set usage threshold
     _drag.usageThreshold = 7; // 20, 5
     
     /// Create mouse moved callback
-    if (_drag.eventTap == nil) {
-        
+    if (!_drag.eventTap) {
+
         CGEventTapLocation location = kCGHIDEventTap;
         CGEventTapPlacement placement = kCGHeadInsertEventTap;
         CGEventTapOptions option = /*kCGEventTapOptionListenOnly*/ kCGEventTapOptionDefault;
@@ -158,7 +173,7 @@ static double _threeFingerPerfQueueLatencyMaxMs = 0.0;
             BOOL isSame = [effectDict isEqualToDictionary:_drag.effectDict];
             BOOL isAddMode = [_drag.effectDict[kMFModifiedDragDictKeyType] isEqual:kMFModifiedDragTypeAddModeFeedback];
             if (!isSame && !isAddMode) {
-//                deactivate_Unsafe(YES);
+                //deactivate_Unsafe(YES);
                 return;
             } else {
                 return;
@@ -171,24 +186,21 @@ static double _threeFingerPerfQueueLatencyMaxMs = 0.0;
         /// Init static parts of `_drag`
         _drag.type = type;
         _drag.effectDict = effectDict;
-//        _drag.initialModifiers = modifiers;
+        //_drag.initialModifiers = modifiers;
         _drag.initTime = CACurrentMediaTime();
         
         id<ModifiedDragOutputPlugin> p;
-        if ([type isEqualToString:kMFModifiedDragTypeThreeFingerSwipe]) {
-            p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputThreeFingerSwipe.class;
-        } else if ([type isEqualToString:kMFModifiedDragTypeTwoFingerSwipe]) {
-            p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputTwoFingerSwipe.class;
-        } else if ([type isEqualToString:kMFModifiedDragTypeFakeDrag]) {
-            p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputFakeDrag.class;
-        } else if ([type isEqualToString:kMFModifiedDragTypeAddModeFeedback]) {
-            p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputAddMode.class;
-        } else {
-            assert(false);
-        }
-        
+        if      ([type isEqualToString:kMFModifiedDragTypeThreeFingerSwipe]) p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputThreeFingerSwipe.class;
+        else if ([type isEqualToString:kMFModifiedDragTypeTwoFingerSwipe])   p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputTwoFingerSwipe.class;
+        else if ([type isEqualToString:kMFModifiedDragTypeFakeDrag])         p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputFakeDrag.class;
+        else if ([type isEqualToString:kMFModifiedDragTypeAddModeFeedback])  p = (id<ModifiedDragOutputPlugin>)ModifiedDragOutputAddMode.class;
+        else                                                                 assert(false);
+
+        _drag.coalesceEvents = true;
+        if (1) if (isclass(p, ModifiedDragOutputTwoFingerSwipe)) _drag.coalesceEvents = false; /// `ModifiedDragOutputTwoFingerSwipe` already has its own `TouchAnimator` which effectively coalesces output events, we think coalescing again here might responsiveness (Didn't really test) [Sep 2026]
+
         /// Link with plugin
-//        [p initializeWithDragState:&_drag];
+        //[p initializeWithDragState:&_drag];
         _drag.outputPlugin = p;
         
         /// Init dynamic parts of _drag
@@ -242,68 +254,45 @@ static CGEventRef __nullable eventTapCallBack(CGEventTapProxy proxy, CGEventType
     /// - I think for all other types of modified drag (aside from the gesture scroll simulation discussed above) this shouldn't break anything, either.
     
     if (dx != 0 || dy != 0) {
-        
-        /// Capture the small pieces of event data we actually need before leaving the event-tap callback.
-        /// Previously we created and retained a full CGEvent copy for every non-zero mouse report,
-        /// even though the ThreeFingerSwipe/TwoFingerSwipe paths never use the event object.
+
+        /// Capture only the scalar data needed after leaving the event-tap callback.
+        /// Avoid copying a CGEvent for every high-polling-rate mouse report.
         CGPoint eventLocation = CGEventGetLocation(event);
         CGEventTimestamp eventTimestamp = CGEventGetTimestamp(event);
-        
-        /// Do main processing on _drag.queue
-        
+
         dispatch_async(_drag.queue, ^{
-            
+
             /// Interrupt
-            ///     This handles race condition where _drag.eventTap is disabled right after eventTapCallBack() is called
-            ///     We implemented the same idea in PointerFreeze.
-            ///     Actually, the check for kMFModifiedInputActivationStateNone below has the same effect, but I think but this makes it clearer?
-            
             if (!CGEventTapIsEnabled(_drag.eventTap)) {
                 return;
             }
-            
-            /// Update originOffset / latest event metadata
-            
-            _drag.originOffset.x += dx;
-            _drag.originOffset.y += dy;
-            _drag.latestEventLocation = eventLocation;
-            
-            /// Suspension
-            if (_drag.isSuspended) return;
-            
-            /// Call further handler functions depending on current state
-            
-            MFModifiedInputActivationState st = _drag.activationState;
-            
-            if (st == kMFModifiedInputActivationStateNone) {
-                
-                /// Disabling the callback triggers this function one more time apparently
-                ///     That's the only case I know where I expect this. Maybe we should log this to see what's going on.
-                
-            } else if (st == kMFModifiedInputActivationStateInitialized) {
-                
-                handleMouseInputWhileInitialized(dx, dy, eventLocation);
-                
-            } else if (st == kMFModifiedInputActivationStateInUse) {
-                
-                if (_threeFingerPerfActive) {
-                    /// CGEvent timestamps are nanoseconds since system startup, while CACurrentMediaTime()
-                    /// uses the same monotonic system-time domain in seconds.
-                    double inputTimeSeconds = ((double)eventTimestamp) / (double)NSEC_PER_SEC;
-                    double queueLatencyMs = (CACurrentMediaTime() - inputTimeSeconds) * 1000.0;
-                    if (queueLatencyMs >= 0.0 && queueLatencyMs < 1000.0) {
-                        _threeFingerPerfInputEvents += 1;
-                        _threeFingerPerfQueueLatencyTotalMs += queueLatencyMs;
-                        _threeFingerPerfQueueLatencyMaxMs = MAX(_threeFingerPerfQueueLatencyMaxMs, queueLatencyMs);
-                    }
+
+            if (_threeFingerPerfActive) {
+                double inputTimeSeconds = ((double)eventTimestamp) / (double)NSEC_PER_SEC;
+                double queueLatencyMs = (CACurrentMediaTime() - inputTimeSeconds) * 1000.0;
+                if (queueLatencyMs >= 0.0 && queueLatencyMs < 1000.0) {
+                    _threeFingerPerfInputEvents += 1;
+                    _threeFingerPerfQueueLatencyTotalMs += queueLatencyMs;
+                    _threeFingerPerfQueueLatencyMaxMs = MAX(_threeFingerPerfQueueLatencyMaxMs, queueLatencyMs);
                 }
-                
-                handleMouseInputWhileInUse(dx, dy, NULL);
             }
-            
+
+            if (!_drag.coalesceEvents) {
+                processCoalescedDeltaEvent(dx, dy, eventLocation);
+            } else {
+                /// Append to coalescableEventQueue
+                CoalescableEvent_Delta *deltaEvent = [CoalescableEvent_Delta new];
+                deltaEvent.deltaX = dx;
+                deltaEvent.deltaY = dy;
+                deltaEvent.pointerLocation = eventLocation;
+                [_drag.coalescableEventQueue addObject: deltaEvent];
+
+                /// Start the coalescingDisplayLink
+                [_drag.coalescingDisplayLink start_UnsafeWithCallback:nil];
+            }
         });
     }
-        
+
     /// Return mouseMoved event
     /// Notes:
     /// - Sending NULL here almost works perfectly, but in screenRecordings it will make the cursor jump. That's especially annoying for DisplayLink users
@@ -316,8 +305,137 @@ static CGEventRef __nullable eventTapCallBack(CGEventTapProxy proxy, CGEventType
     return event;
 }
 
-static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGPoint eventLocation) {
-    
+void coalescingDisplayLinkCallback(DisplayLinkCallbackTimeInfo timeInfo) {
+
+    /// On using `dispatch_async(_drag.queue, ...)` here:
+    ///     Do this to move this code off of the displayLink thread to solve deadlock, where [Sep 2026]
+    ///             ```
+    ///             displayLinkThread -> main (This code -> twoFingerDrag -> PointerFreeze -> `dispatch_sync(main)` (Not sure if this has to be `dispatch_sync`))
+    ///             main -> displayLinkThread (This code (I think) -> `-[DisplayLink stop_Unsafe]` -> `dispatch_async(main)` -> `CVDisplayLinkStop()` (Requires the private mutex that the displayLinkThread holds, I think))
+    ///             ```
+    ///         Drawback: Not running on displayLinkThread makes this code lower priority, might affect responsiveness.
+    ///         Alternatives:
+    ///             - Drive mainThread PointerFreeze stuff asynchronously (Not sure there's any reason not to do that) [Sep 2026]
+    ///             - Try not calling `CVDisplayLinkStop` from main. (But old notes suggest main was necessary to prevent mysterious errors) [Sep 2026]
+    ///     Update: [Sep 2026]
+    ///         Instead of this, we're using `-[DisplayLink setDispatchCallbacksAsynchronously: YES];` now. It takes effect in `DisplayLink.m > displayLinkCallback` – basically does the same thing at an earlier level in the processing chain (which could still deadlock.)
+    ///         Deadlock I saw which this prevents:
+    ///             ```
+    ///             main -> displayLinkThread               (-[DisplayLink stop_Unsafe] -> dispatch_async(main) -> CVDisplayLinkStop())
+    ///             displayLinkThread -> displayLinkQueue   (displayLinkCallback -> dispatch_sync(self.dispatchQueue, ...))
+    ///             displayLinkQueue -> main                (coalescingDisplayLinkCallback -> dispatch_async(_drag.queue, ...) -> twoFingerSwipe -> PointerFreeze -> dispatch_sync(dispatch_get_main_queue(), ...))
+    ///             ```
+    ///             Alternatives:
+    ///                 Break sync dispatch `displayLinkQueue -> main`. But this would be more complicated refactor, might break something about PointerFreeze (can't find comments about why we're doing sync dispatch), and`coalescingDisplayLinkCallback` doesn't have any drawbacks over previous `dispatch_async(_drag.queue, ...)` in this function that I can think of.
+    //dispatch_async(_drag.queue, ^{
+
+    /// Early return
+    if (!_drag.coalescableEventQueue.count) return;
+
+    /// Gather/coalesce data from queue
+    double deltaXSum = 0;
+    double deltaYSum = 0;
+    CoalescableEvent_Delta *lastDeltaEvent = nil;
+    CoalescableEvent_Deactivation *deactivationEvent = nil;
+    {
+        for (CoalescableEvent *event in _drag.coalescableEventQueue) {
+            if (isclass(event, CoalescableEvent_Deactivation)) {
+                deactivationEvent = (id)event;
+                break;
+            }
+            else if (isclass(event, CoalescableEvent_Delta)) {
+                CoalescableEvent_Delta *event_ = (id)event;
+                deltaXSum += event_.deltaX;
+                deltaYSum += event_.deltaY;
+                lastDeltaEvent = event_;
+            }
+            else mfassert(false, @"Unknown ModifiedDrag_Event: %@", event);
+        }
+    }
+    CGPoint lastPointerLocation = getRoundedPointerLocationWithPointerLocation(lastDeltaEvent.pointerLocation);
+
+    /// Clear queue
+    [_drag.coalescableEventQueue removeAllObjects];
+
+    /// Stop coalescingDisplayLink
+    ///     (We just aggregate everything for the next frame, and then stop)
+    ///     Performance note: [Sep 2026] This makes CVDisplayLink stop its thread every frame, and then create/configure a new thread for the next frame, I think.
+    ///         However, the overhead of this is dwarfed by CGEvent tapping and sending.
+    ///         Avoiding this would lower CPU usage by `<~3%` on my Logitech gaming mouse (1000 Hz) and lower by `<~7%` on Logitech lift (not sure exactly its polling rate, I think low.)
+    ///             (Measured on M4 MBA, wiggling the DockSwipe, using 'processor trace' in instruments, 120 Hz display I think, might have accidentally used 60 Hz for some tests.)
+    ///             (Percentages are relative to current CPU usage, which is `~3%` on Lift and `~7%` on the gaming mouse IIRC, so in absolute terms, this should lower CPU usage by `<~0.2%`.)
+    ///         -> Since I plan on eventually using CADisplayLink for newer macOS (instead of CVDisplayLink), I won't bother optimizing this.
+
+    [_drag.coalescingDisplayLink stop_Unsafe];
+
+    /// Process coalesced delta event(s)
+    processCoalescedDeltaEvent(deltaXSum, deltaYSum, lastPointerLocation);
+
+    /// Process deactivationEvent
+    processCoalescedDeactivationEvent(deactivationEvent);
+
+    //});
+}
+
+void processCoalescedDeltaEvent(double deltaXSum, double deltaYSum, CGPoint lastPointerLocation) {
+    if (deltaXSum || deltaYSum)
+    {
+        /// Update originOffset
+        _drag.originOffset.x += deltaXSum;
+        _drag.originOffset.y += deltaYSum;
+
+        /// Suspension
+        if (_drag.isSuspended) return;
+
+        /// Count actual display-linked processing passes for diagnostics.
+        if (_threeFingerPerfActive) {
+            _threeFingerPerfCoalescedFrames += 1;
+        }
+
+#if DEBUG
+        DDLogDebug("ModifiedDrag handling coalesced mouseMoved");
+#endif
+
+        /// Call further handler functions depending on current state
+        MFModifiedInputActivationState st = _drag.activationState;
+
+        if (st == kMFModifiedInputActivationStateNone) {
+
+            /// [Sep 2026] Old comment from before coalescingDisplayLink refactor:
+            ///     Disabling the callback triggers this function one more time apparently
+            ///         That's the only case I know where I expect this. Maybe we should log this to see what's going on.
+
+        } else if (st == kMFModifiedInputActivationStateInitialized) {
+
+            handleMouseInputWhileInitialized(deltaXSum, deltaYSum, lastPointerLocation);
+
+        } else if (st == kMFModifiedInputActivationStateInUse) {
+
+            handleMouseInputWhileInUse(deltaXSum, deltaYSum);
+        }
+    }
+}
+
+void processCoalescedDeactivationEvent(CoalescableEvent_Deactivation *deactivationEvent) {
+    if (!deactivationEvent) return;
+
+    [_drag.outputPlugin handleDeactivationWhileInUseWithCancel:deactivationEvent.cancelled];
+
+    if (_threeFingerPerfActive) {
+        double avgQueueLatencyMs = _threeFingerPerfInputEvents == 0
+            ? 0.0
+            : _threeFingerPerfQueueLatencyTotalMs / (double)_threeFingerPerfInputEvents;
+        DDLogInfo("DockSwipe perf: inputs=%llu, display-linked frames=%llu, queue latency avg=%.3fms max=%.3fms",
+                  _threeFingerPerfInputEvents,
+                  _threeFingerPerfCoalescedFrames,
+                  avgQueueLatencyMs,
+                  _threeFingerPerfQueueLatencyMaxMs);
+    }
+    _threeFingerPerfActive = NO;
+}
+
+static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGPoint pointerLocation) {
+
     /// Activate the modified drag if the mouse has been moved far enough from the point where the drag started
     
     Vector ofs = _drag.originOffset;
@@ -327,8 +445,8 @@ static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGP
         DDLogDebug("Modified Drag entered 'in use' state");
         
         /// Store state
-        _drag.usageOrigin = (CGPoint){ .x = floor(eventLocation.x), .y = floor(eventLocation.y) };
-        
+        _drag.usageOrigin = pointerLocation;
+
         if (fabs(ofs.x) < fabs(ofs.y)) {
             _drag.usageAxis = kMFAxisVertical;
         } else {
@@ -338,7 +456,16 @@ static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGP
         /// Update state
         _drag.activationState = kMFModifiedInputActivationStateInUse;
         _drag.firstCallback = true;
-        
+
+        _threeFingerPerfActive = [_drag.type isEqualToString:kMFModifiedDragTypeThreeFingerSwipe];
+        _threeFingerPerfInputEvents = 0;
+        _threeFingerPerfCoalescedFrames = 0;
+        _threeFingerPerfQueueLatencyTotalMs = 0.0;
+        _threeFingerPerfQueueLatencyMaxMs = 0.0;
+
+        /// Init coalescingDisplayLink
+        [_drag.coalescingDisplayLink linkToMainScreen_Unsafe];
+
         /// Do deferred init
         /// Could also do this in normal init `initializeDragWithDict`, but here is more effiicient (`initializeDragWithDict` is called on every mouse click if it's set up for that button)
         /// -> Don't use `naturalDirection` before state switches to `kMFModifiedInputActivationStateInUse`!
@@ -350,12 +477,6 @@ static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGP
     
         NSNumber *systemScrollDirection = [NSUserDefaults.standardUserDefaults objectForKey:@"com.apple.swipescrolldirection"];
         _drag.naturalDirection = systemScrollDirection == nil ? true : systemScrollDirection.boolValue;
-        
-        /// Reset aggregate performance diagnostics at the exact start of a three-finger gesture.
-        _threeFingerPerfActive = [_drag.type isEqualToString:kMFModifiedDragTypeThreeFingerSwipe];
-        _threeFingerPerfInputEvents = 0;
-        _threeFingerPerfQueueLatencyTotalMs = 0.0;
-        _threeFingerPerfQueueLatencyMaxMs = 0.0;
         
         /// Notify output plugin
         [_drag.outputPlugin handleBecameInUse];
@@ -369,16 +490,16 @@ static void handleMouseInputWhileInitialized(int64_t deltaX, int64_t deltaY, CGP
     }
 }
 /// Only passing in event to obtain event location to get slightly better behaviour for fakeDrag
-void handleMouseInputWhileInUse(int64_t deltaX, int64_t deltaY, CGEventRef event) {
+void handleMouseInputWhileInUse(int64_t deltaX, int64_t deltaY) {
     
     /// Invert direction
     if (!_drag.naturalDirection) {
         deltaX = -deltaX;
         deltaY = -deltaY;
     }
-    
+
     /// Notifiy plugin
-    [_drag.outputPlugin handleMouseInputWhileInUseWithDeltaX:deltaX deltaY:deltaY event:event];
+    [_drag.outputPlugin handleMouseInputWhileInUseWithDeltaX:deltaX deltaY:deltaY];
     
     /// Update phase
     ///
@@ -449,16 +570,16 @@ void deactivate_Unsafe(BOOL cancel) {
     /// Handle state == In use
     ///     Notify plugin
     if (_drag.activationState == kMFModifiedInputActivationStateInUse) {
-        [_drag.outputPlugin handleDeactivationWhileInUseWithCancel:cancel];
-        
-        if (_threeFingerPerfActive) {
-            double avgQueueLatencyMs = _threeFingerPerfInputEvents == 0
-                ? 0.0
-                : _threeFingerPerfQueueLatencyTotalMs / (double)_threeFingerPerfInputEvents;
-            DDLogInfo("DockSwipe perf: modified-drag inputs=%llu, queue latency avg=%.3fms max=%.3fms",
-                      _threeFingerPerfInputEvents, avgQueueLatencyMs, _threeFingerPerfQueueLatencyMaxMs);
+
+        CoalescableEvent_Deactivation *coalescableEvent = [CoalescableEvent_Deactivation new];
+        coalescableEvent.cancelled = cancel;
+
+        if (!_drag.coalesceEvents) {
+            processCoalescedDeactivationEvent(coalescableEvent);
+        } else {
+            [_drag.coalescableEventQueue addObject: coalescableEvent];
+            [_drag.coalescingDisplayLink start_UnsafeWithCallback: nil];
         }
-        _threeFingerPerfActive = NO;
     }
     
     /// Set state == none
@@ -504,11 +625,14 @@ CGPoint getRoundedPointerLocation(void) {
     return location;
 }
 static CGPoint getRoundedPointerLocationWithEvent(CGEventRef event) {
+    return getRoundedPointerLocationWithPointerLocation(CGEventGetLocation(event));
+}
+
+static CGPoint getRoundedPointerLocationWithPointerLocation(CGPoint pointerLocation) {
     /// I thought it was necessary to use this on _drag.origin to calculate the _drag.usageOrigin properly.
     /// To get the _drag.usageOrigin, I used to take the _drag.origin (which is float) and add the kCGMouseEventDeltaX and DeltaY (which are ints)
     ///     But even with rounding it didn't work properly so we went over to getting usageOrigin directly from a CGEvent. I think with this new setup there might not be a  reason to use the getRoundedPointerLocation functions anymore. But I'll just leave them in because they don't break anything.
-    
-    CGPoint pointerLocation = CGEventGetLocation(event);
+
     CGPoint pointerLocationRounded = (CGPoint){ .x = floor(pointerLocation.x), .y = floor(pointerLocation.y) };
     return pointerLocationRounded;
 }
