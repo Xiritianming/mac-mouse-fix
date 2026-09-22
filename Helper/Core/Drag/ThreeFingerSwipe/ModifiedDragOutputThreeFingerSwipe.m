@@ -13,6 +13,7 @@
 @import Cocoa;
 #import "PointerFreeze.h"
 #import "Mac_Mouse_Fix_Helper-Swift.h"
+#import "CGSDisplays.h"
 
 @implementation ModifiedDragOutputThreeFingerSwipe
 
@@ -21,6 +22,7 @@
 static ModifiedDragState *_drag;
 
 static int16_t _nOfSpaces = 1;
+static NSSize _screenSize = {};
 static double _threeFingerScaleH = 0.0;
 static double _threeFingerScaleV = 0.0;
 
@@ -31,28 +33,34 @@ static double _threeFingerScaleV = 0.0;
 }
 
 + (void)handleBecameInUse {
-    /// Resolve screen-dependent scaling once per gesture instead of querying NSScreen
-    /// and recomputing the same constants for every mouse report.
-    CGSize screenSize = NSScreen.mainScreen.frame.size;
-    
-    /// Get number of spaces only when we actually need horizontal DockSwipe scaling.
-    /// Mission Control / vertical DockSwipes do not use this value, and querying Spaces
-    /// synchronously while WindowServer is transitioning is unnecessary work on the
-    /// gesture-start path.
+
+    NSScreen *screen = [NSScreen mainScreen];
+
+    /// Cache screen-dependent scaling once per gesture.
+    /// This keeps the mouse-report hot path free of NSScreen / Spaces queries.
+    _screenSize = [screen frame].size;
+
     if (_drag->usageAxis == kMFAxisHorizontal) {
-        CFArrayRef spaces = CGSCopySpaces(CGSMainConnectionID(), CGSSpaceIncludesUser | CGSSpaceIncludesOthers | CGSSpaceIncludesCurrent);
-        /// Full screen spaces appear twice for some reason so we need to filter duplicates
-        NSSet *uniqueSpaces = [NSSet setWithArray:(__bridge NSArray *)spaces];
-        _nOfSpaces = uniqueSpaces.count;
-        CFRelease(spaces);
-        
-        double originOffsetForOneSpace = _nOfSpaces == 1 ? 2.0 : 1.0 + (1.0 / (_nOfSpaces - 1));
+        /// Support multiple displays by counting Spaces for the display that owns the current screen.
+        NSArray *spacesInfo = CFBridgingRelease(CGSCopyManagedDisplaySpaces(CGSMainConnectionID()));
+        NSString *screenUUID = [screen mf_UUIDString];
+
+        NSDictionary *entry = nil;
+        for (NSDictionary *screenDict in spacesInfo) {
+            if ([[screenDict objectForKey:@"Display Identifier"] isEqual:screenUUID]) {
+                entry = screenDict;
+                break;
+            }
+        }
+
+        _nOfSpaces = MAX((int16_t)[[entry objectForKey:@"Spaces"] count], (int16_t)1);
+        double originOffsetForOneSpace = _nOfSpaces <= 1 ? 2.0 : 1.0 + (1.0 / (_nOfSpaces - 1));
         const double spaceSeparatorWidth = 63.0;
-        _threeFingerScaleH = screenSize.width > 0.0
-            ? originOffsetForOneSpace / (screenSize.width + spaceSeparatorWidth)
+        _threeFingerScaleH = _screenSize.width > 0.0
+            ? originOffsetForOneSpace / (_screenSize.width + spaceSeparatorWidth)
             : 0.0;
     } else if (_drag->usageAxis == kMFAxisVertical) {
-        _threeFingerScaleV = screenSize.height > 0.0 ? 1.0 / screenSize.height : 0.0;
+        _threeFingerScaleV = _screenSize.height > 0.0 ? 1.0 / _screenSize.height : 0.0;
     }
 
     /// Freeze pointer
@@ -61,28 +69,20 @@ static double _threeFingerScaleV = 0.0;
     }
 }
 
-+ (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY event:(CGEventRef)event {
++ (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY {
     
     /// Get phase
+    
     IOHIDEventPhaseBits eventPhase = _drag->firstCallback ? kIOHIDEventPhaseBegan : kIOHIDEventPhaseChanged;
-
-    /// Send events directly from the modified-drag path. TouchSimulator coalesces
-    /// high-rate Changed events before posting them to WindowServer, while Began / Ended /
-    /// Cancelled remain immediate.
+    
+    /// Send events
+    
     if (_drag->usageAxis == kMFAxisHorizontal) {
-        /**
-         Horizontal DockSwipe scaling
-         This makes horizontal DockSwipes (switch between spaces) follow the pointer exactly.
-         */
         double delta = -deltaX * _threeFingerScaleH;
         [TouchSimulator postDockSwipeEventWithDelta:delta type:kMFDockSwipeTypeHorizontal phase:eventPhase invertedFromDevice:_drag->naturalDirection];
     } else if (_drag->usageAxis == kMFAxisVertical) {
-        /// Vertical DockSwipe scaling
-        ///     Not sure if it makes sense to scale this with screen height
         double delta = deltaY * _threeFingerScaleV;
         [TouchSimulator postDockSwipeEventWithDelta:delta type:kMFDockSwipeTypeVertical phase:eventPhase invertedFromDevice:_drag->naturalDirection];
-    } else {
-        assert(false);
     }
 }
 
@@ -91,13 +91,9 @@ static double _threeFingerScaleV = 0.0;
     MFDockSwipeType type;
     IOHIDEventPhaseBits phase;
     
-    if (_drag->usageAxis == kMFAxisHorizontal) {
-        type = kMFDockSwipeTypeHorizontal;
-    } else if (_drag->usageAxis == kMFAxisVertical) {
-        type = kMFDockSwipeTypeVertical;
-    } else {
-        assert(false);
-    }
+    if      (_drag->usageAxis == kMFAxisHorizontal) type = kMFDockSwipeTypeHorizontal;
+    else if (_drag->usageAxis == kMFAxisVertical)   type = kMFDockSwipeTypeVertical;
+    else                                            assert(false);
     
     phase = cancel ? kIOHIDEventPhaseCancelled : kIOHIDEventPhaseEnded;
     
