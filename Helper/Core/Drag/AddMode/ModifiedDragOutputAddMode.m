@@ -36,7 +36,7 @@ static BOOL _didConclude;
     return;
 }
 
-+ (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY event:(CGEventRef _Nullable)event {
++ (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY {
     
     if (!_didConclude) {
         if (_addModePayload != nil) {
