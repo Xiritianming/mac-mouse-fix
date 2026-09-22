@@ -125,48 +125,17 @@ static NSMutableDictionary *_swipeInfo;
     /// State
     static double _dockSwipeOriginOffset = 0.0;
     static double _dockSwipeLastDelta = 0.0;
-    static CFTimeInterval _dockSwipeLastPostTime = 0.0;
-    static double _dockSwipeCoalescedDelta = 0.0;
-    static uint64_t _dockSwipeChangedInputCount = 0;
-    static uint64_t _dockSwipeChangedPostCount = 0;
     static NSTimer *_doubleSendTimer;
     static NSTimer *_tripleSendTimer;
     
-    /// Update originOffset and coalesce macOS 27 Changed events to roughly the cadence
-    /// of a real trackpad (~125 Hz / 8 ms). The absolute progress is always accumulated
-    /// before throttling, so skipped input reports never lose movement.
+    /// Update originOffset.
+    /// High-polling-rate input is now coalesced upstream in ModifiedDrag on the display cadence,
+    /// so TouchSimulator should post every coalesced update without applying a second fixed-rate throttle.
     if (phase == kIOHIDEventPhaseBegan) {
         _dockSwipeOriginOffset = d;
-        if (@available(macOS 27.0, *)) {
-            _dockSwipeLastPostTime = CACurrentMediaTime();
-            _dockSwipeCoalescedDelta = 0.0;
-            _dockSwipeChangedInputCount = 0;
-            _dockSwipeChangedPostCount = 0;
-        }
     } else if (phase == kIOHIDEventPhaseChanged) {
         if (d == 0) return;
         _dockSwipeOriginOffset += d;
-        if (@available(macOS 27.0, *)) {
-            _dockSwipeChangedInputCount += 1;
-            _dockSwipeCoalescedDelta += d;
-            CFTimeInterval now = CACurrentMediaTime();
-            if (now - _dockSwipeLastPostTime < (1.0 / 125.0)) return;
-            _dockSwipeLastPostTime = now;
-            d = _dockSwipeCoalescedDelta;
-            _dockSwipeCoalescedDelta = 0.0;
-            _dockSwipeChangedPostCount += 1;
-        }
-    } else if (phase == kIOHIDEventPhaseEnded || phase == kIOHIDEventPhaseCancelled) {
-        if (@available(macOS 27.0, *)) {
-            /// If the button is released inside the coalescing interval, the final absolute
-            /// progress is already correct. Preserve the pending movement as the recent
-            /// delta as well, so exit velocity and end-vs-cancel direction stay meaningful.
-            if (_dockSwipeCoalescedDelta != 0.0) {
-                _dockSwipeLastDelta = _dockSwipeCoalescedDelta;
-            }
-            _dockSwipeCoalescedDelta = 0.0;
-            _dockSwipeLastPostTime = 0.0;
-        }
     }
     
     /// Debug
@@ -349,15 +318,8 @@ static NSMutableDictionary *_swipeInfo;
     } else if (phase == kIOHIDEventPhaseEnded || phase == kIOHIDEventPhaseCancelled) {
 
         if (@available(macOS 27.0, *)) {
-            /// A/B path for macOS 27: do not re-post stale End events at +200ms/+500ms.
+            /// Do not re-post stale End events at +200ms/+500ms on macOS 27.
             /// Those delayed events can overlap the next rapid gesture and add transition latency.
-            /// Keep the old workaround intact on earlier macOS versions until this is proven safe.
-            DDLogInfo("DockSwipe perf: changed inputs=%llu, posted=%llu, coalescing ratio=%.2fx",
-                      _dockSwipeChangedInputCount,
-                      _dockSwipeChangedPostCount,
-                      _dockSwipeChangedPostCount == 0
-                        ? 0.0
-                        : (double)_dockSwipeChangedInputCount / (double)_dockSwipeChangedPostCount);
         } else {
             /// Double-send end-events
             /// Notes:
