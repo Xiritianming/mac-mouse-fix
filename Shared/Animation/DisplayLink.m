@@ -35,16 +35,17 @@
 @interface DisplayLink ()
 
 typedef enum {
-    kMFDisplayLinkRequestedStateStopped = 0,
-    kMFDisplayLinkRequestedStateRunning,
+    kMFDisplayLinkRequestedState_Stopped = 0,
+    kMFDisplayLinkRequestedState_Running,
 } MFDisplayLinkRequestedState;
 
 @end
 
 /// Wrapper object for CVDisplayLink that uses blocks
 /// Didn't write this in Swift, because CVDisplayLink is clearly a C API that's been machine-translated to Swift. So it should be easier to deal with from ObjC
-@implementation DisplayLink {
-    
+@implementation DisplayLink
+{
+
     CVDisplayLinkRef _displayLink;
     CGDirectDisplayID *_previousDisplaysUnderMousePointer; /// Old and unused, use `_previousDisplayUnderMousePointer` instead
     CGDirectDisplayID _previousDisplayUnderMousePointer;
@@ -52,6 +53,8 @@ typedef enum {
     dispatch_queue_t _displayLinkQueue;
     MFDisplayLinkRequestedState _requestedState;
     MFDisplayLinkWorkType _optimizedWorkType;
+
+    NSString *_identifier;
 }
 
 @synthesize dispatchQueue=_displayLinkQueue;
@@ -116,27 +119,35 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
 
 /// Convenience init
 
+
 + (instancetype)displayLinkOptimizedForWorkType:(MFDisplayLinkWorkType)workType {
-    return [[DisplayLink alloc] initOptimizedForWorkType:workType];
+
+    /// Setup default queue
+    dispatch_queue_attr_t attrs = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, -1);
+    dispatch_queue_t displayLinkQueue = dispatch_queue_create("com.nuebling.mac-mouse-fix.helper.display-link", attrs); /// TODO: Remove .helper from the queue name. This is used in the mainApp, too.
+
+    /// Call main init
+    return [self displayLinkOptimizedForWorkType: workType displayLinkQueue: displayLinkQueue];
+}
++ (instancetype) displayLinkOptimizedForWorkType:(MFDisplayLinkWorkType)workType displayLinkQueue:(dispatch_queue_t)displayLinkQueue {
+    return [[self alloc] initOptimizedForWorkType: workType displayLinkQueue: displayLinkQueue];
 }
 
 /// Init
+- (instancetype)initOptimizedForWorkType:(MFDisplayLinkWorkType)workType displayLinkQueue: (dispatch_queue_t)displayLinkQueue {
 
-- (instancetype)initOptimizedForWorkType:(MFDisplayLinkWorkType)workType {
-    
     self = [super init];
     if (self) {
         
         /// Store type of work for which to optimize
         self->_optimizedWorkType = workType;
         
-        /// Setup queue
-        dispatch_queue_attr_t attrs = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, -1);
-        _displayLinkQueue = dispatch_queue_create("com.nuebling.mac-mouse-fix.helper.display-link", attrs); /// TODO: Remove .helper from the queue name. This is used in the mainApp, too.
-        
         /// Setup internal CVDisplayLink
         [self setUpNewDisplayLinkWithActiveDisplays];
-        
+
+        /// Store displayLinkQueue
+        _displayLinkQueue = displayLinkQueue;
+
         /// Init displaysUnderMousePointer cache
         _previousDisplaysUnderMousePointer = malloc(sizeof(CGDirectDisplayID) * 2);
         /// ^ Why 2? - see `setDisplayToDisplayUnderMousePointerWithEvent:`
@@ -145,7 +156,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         _displayLinkIsOutdated = NO;
         
         /// Init `_requestedState`
-        _requestedState = kMFDisplayLinkRequestedStateStopped;
+        _requestedState = kMFDisplayLinkRequestedState_Stopped;
         
         /// Setup display reconfiguration callback
         CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, (__bridge void * _Nullable)(self));
@@ -236,50 +247,59 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     });
 }
 
-- (void)start_UnsafeWithCallback:(DisplayLinkCallback _Nonnull)callback {
+- (void)start_UnsafeWithCallback:(DisplayLinkCallback _Nullable)callback {
 
-    
     /// Debug
     DDLogDebug("DisplayLink.m: (%@) starting", [self identifier]);
     
     /// Store callback
-    
-    self.callback = callback;
-    
+    if (callback) /// Set to nil to preserve existing callback
+        self.callback = callback;
+
+    /// Early return
+    if ((1)) /// [Sep 2026] Added this as optimization, not being totally it's correct
+    if (_requestedState == kMFDisplayLinkRequestedState_Running) {
+        if ((0)) DDLogDebug("DisplayLink.m: (%@) already starting/started", [self identifier]);
+        return;
+    }
+
     /// Start the displayLink
     ///     If something goes wrong see notes in old SmoothScroll.m > handleInput: method
     
     /// Starting the displayLink often fails with error code `-6660` for some reason.
     ///     Running on the main queue seems to fix that. (See SmoothScroll_old_).
     ///     We don't wanna use `dispatch_sync(dispatch_get_main_queue())` here because if were already running on the main thread(/queue?) then that'll crash
-    
-    /// Define block that starts displayLink
-    
-    void (^startDisplayLinkBlock)(void) = ^{
-        
-        int64_t failedAttempts = 0;
-        int64_t maxAttempts = 100;
-        
-        while (true) {
-            CVReturn rt = CVDisplayLinkStart(self->_displayLink); /// This locks until the displayLinkCallback is done
-            if (rt == kCVReturnSuccess) break;
-            
-            failedAttempts += 1;
-            if (failedAttempts >= maxAttempts) {
-                DDLogInfo("DisplayLink.m: (%@) Failed to start CVDisplayLink after %lld tries. Last error code: %d", [self identifier], failedAttempts, rt);
-                break;
+
+    void (^startDisplayLinkBlock)(void) = nil;
+    {
+
+        /// Set requestedState
+        ///     before async dispatching to main -> so that isRunning() works properly
+        _requestedState = kMFDisplayLinkRequestedState_Running;
+
+        /// Define block that starts displayLink
+        startDisplayLinkBlock = ^{
+
+            int64_t failedAttempts = 0;
+            int64_t maxAttempts = 100;
+
+            while (true) {
+                CVReturn rt = CVDisplayLinkStart(self->_displayLink); /// This locks until the displayLinkCallback is done
+                if (rt == kCVReturnSuccess) break;
+
+                failedAttempts += 1;
+                if (failedAttempts >= maxAttempts) {
+                    DDLogInfo("DisplayLink.m: (%@) Failed to start CVDisplayLink after %lld tries. Last error code: %d", [self identifier], failedAttempts, rt);
+                    break;
+                }
             }
-        }
-    };
-    
-    /// Set requestedState
-    ///     before async dispatching to main -> so that isRunning() works properly
-    _requestedState = kMFDisplayLinkRequestedStateRunning;
-    
+        };
+    }
+
     /// Make sure block is running on the main thread
     
-    if ((NO)) {
-        
+    if ((0)) {
+
         /// Dispatch to main synchronously
         
         if (NSThread.isMainThread) {
@@ -353,7 +373,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         /// Set requestedState
         ///     before async dispatching to main -> so that isRunning() works properly
         
-        _requestedState = kMFDisplayLinkRequestedStateStopped;
+        _requestedState = kMFDisplayLinkRequestedState_Stopped;
         
         if ((NO)) {
             
@@ -417,10 +437,11 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
 
 + (NSString *)identifierForDisplayLink:(CVDisplayLinkRef)dl { /// This id stuff is for debugging
     int64_t pointerNumber = (int64_t)(void *)dl;
-    return [NSString stringWithFormat:@"%lld", pointerNumber];
+    return [NSString stringWithFormat: @"%lld", pointerNumber];
 }
-- (NSString *)identifier { /// [Apr 2025] for debugging it would be handy to give the displayLink a 'name' based on where it's used
-    return [DisplayLink identifierForDisplayLink:_displayLink];
+- (NSString *) identifier { /// [Apr 2025] for debugging it would be handy to give the displayLink a 'name' based on where it's used
+    if (!_identifier) _identifier = [DisplayLink identifierForDisplayLink: _displayLink];
+    return _identifier;
 }
 
 - (CFTimeInterval)bestTimeBetweenFramesEstimate {
@@ -471,7 +492,9 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     ///     - TODO: actually use this instead of `linkToMainScreen` and test if this new version works.
     /// - I think this would be appropriate to use for event sending, not for animation, since it's based on a CGEvent) - For animation we need another approach.
     ///     - (But I think if we move over from the deprecated CVDisplayLink to the new CADisplayLink, we'll have to use a different approach anyways.)
-    
+    /// - Update: [Sep 2026] I think `-linkToMainScreen` is wrong everywhere we use it – should replace with `-linkToDisplayUnderMousePointerWithEvent:` or equivalent.
+    ///     Don't forget to update other hardcoded mainScreen references (`NSScreen.mainScreen`). Maybe other stuff.
+
 #if IS_HELPER
     
     __block CVReturn result;
@@ -618,21 +641,26 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
     ///     - [Aug 2025] Eventually, we may want to move to CADisplayLink and async-dispatch to the "IOThread" we're planning. This would resolve the deadlock, too (See `Old MFDisplayLinkWorkType stuff.md`)
     
     DisplayLink *self = (__bridge DisplayLink *)displayLinkContext; /// [Aug 2025] Why are we getting this outside `dispatch_sync()`? Spending time outside `dispatch_sync()` increases chances of deadlock.
-    
-    dispatch_sync(self.dispatchQueue, ^{ /// [Aug 2025] Recovered notes from 3.0.0: Use sync so this is actually executed on the high-priority display-linked thread // Why are we using self.dispatchQueue instead of `self->_displayLinkQueue`? I think self.dispatchQueue might cause some weird timing stuff since objc props are often atomic and stuff..
-            
+
+    __block DisplayLinkCallbackTimeInfo timeInfo;
+
+    auto workload = ^{ /// [Aug 2025] Recovered notes from 3.0.0: Use sync so this is actually executed on the high-priority display-linked thread // Why are we using self.dispatchQueue instead of `self->_displayLinkQueue`? I think self.dispatchQueue might cause some weird timing stuff since objc props are often atomic and stuff..
+
         DDLogDebug("DisplayLink.m: (%@) Callback", [self identifier]);
-         
-        DisplayLinkCallbackTimeInfo timeInfo = parseTimeStamps(inNow, inOutputTime);
-         
-        if (self->_requestedState == kMFDisplayLinkRequestedStateStopped) {
+
+        if (!self->_dispatchCallbacksAsynchronously) timeInfo = parseTimeStamps(inNow, inOutputTime);
+
+        if (self->_requestedState == kMFDisplayLinkRequestedState_Stopped) {
             DDLogDebug("DisplayLink.m: (%@) callback called after requested stop. Returning", [self identifier]);
             return;
         }
-        
+
         self.callback(timeInfo);
-    });
-    
+    };
+    if (self->_dispatchCallbacksAsynchronously) timeInfo = parseTimeStamps(inNow, inOutputTime); /// [Sep 2026] Get timeInfo before `dispatch_async`, since it looked like capturing the input values (the CVTimeStamps) in the block was very slow (didn't really test). In the `dispatch_sync` case we want to dispatch as early as possible to lower chance of deadlocks (Explained in comments above as of [Sep 2026])
+    if (self->_dispatchCallbacksAsynchronously) dispatch_async(self.dispatchQueue, workload);
+    else                                        dispatch_sync(self.dispatchQueue, workload);
+
     return kCVReturnSuccess;
 }
 
