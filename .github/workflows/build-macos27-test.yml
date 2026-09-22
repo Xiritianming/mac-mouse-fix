@@ -7,6 +7,7 @@ on:
       - fix/macos27-dockswipe-coalescing
       - test/forced-region-code
       - perf/macos27-dockswipe-hotpath
+      - perf/macos27-upstream-coalescing
   workflow_dispatch:
 
 permissions:
@@ -71,17 +72,17 @@ jobs:
         run: |
           set -euo pipefail
           APP="$RUNNER_TEMP/mmf-derived-data/Build/Products/Release/Mac Mouse Fix.app"
-          OUT="$RUNNER_TEMP/MacMouseFix-macOS27-hotpath-test.zip"
+          OUT="$RUNNER_TEMP/MacMouseFix-macOS27-upstream-coalescing-test.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT"
-          shasum -a 256 "$OUT" | tee "$RUNNER_TEMP/MacMouseFix-macOS27-hotpath-test.sha256"
+          shasum -a 256 "$OUT" | tee "$RUNNER_TEMP/MacMouseFix-macOS27-upstream-coalescing-test.sha256"
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MacMouseFix-macOS27-hotpath-test
+          name: MacMouseFix-macOS27-upstream-coalescing-test
           path: |
-            ${{ runner.temp }}/MacMouseFix-macOS27-hotpath-test.zip
-            ${{ runner.temp }}/MacMouseFix-macOS27-hotpath-test.sha256
+            ${{ runner.temp }}/MacMouseFix-macOS27-upstream-coalescing-test.zip
+            ${{ runner.temp }}/MacMouseFix-macOS27-upstream-coalescing-test.sha256
           if-no-files-found: error
           retention-days: 14
 
